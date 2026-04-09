@@ -1,0 +1,553 @@
+// Copyright 2026 Oddbit (https://oddbit.id)
+// SPDX-License-Identifier: Apache-2.0
+//
+// Worker entry point.
+//
+// Authentication architecture:
+// - Cloudflare Access protects the MCP endpoint (/_/mcp) as a self-hosted
+//   application with Managed OAuth enabled. Access handles the full OAuth
+//   protocol for MCP clients: discovery, client registration, token
+//   issuance, and token validation.
+// - By the time requests reach this Worker, Access has validated the
+//   token and added identity headers (Cf-Access-Jwt-Assertion,
+//   Cf-Access-Authenticated-User-Email).
+// - The Worker extracts identity from these headers and passes it as
+//   props to the McpAgent Durable Object via ctx.props.
+// - The admin dashboard (/_/admin/*) is protected by a separate Access
+//   application with its own policies.
+// - In dev mode (no ACCESS_AUD), identity falls back to DEV_IDENTITY
+//   or "anonymous" so MCP and admin routes work without Access.
+
+import { Hono } from "hono";
+import type { Env } from "./types";
+import { verifyAccessJwt, extractIdentity, isSignedIn, type AccessUser } from "./access";
+import { handleRedirect } from "./redirect";
+import { unauthorizedResponse } from "./auth";
+import {
+  authenticateApiKey,
+  getAppSettings,
+  getDashboardStats,
+  getLinkAnalytics,
+  listLinks,
+  getLink,
+  searchLinks,
+  listAllApiKeys,
+} from "./services";
+import { DEFAULT_SLUG_LENGTH } from "./constants";
+import { createTranslateFn, getTranslations } from "./i18n";
+import { handleHealth } from "./api/health";
+import {
+  handleListLinks,
+  handleGetLink,
+  handleCreateLink,
+  handleUpdateLink,
+  handleDisableLink,
+  handleDeleteLink,
+  handleGetLinkBySlug,
+} from "./api/links";
+import {
+  handleAddCustomSlug,
+  handleSetPrimarySlug,
+  handleDisableSlug,
+  handleEnableSlug,
+  handleRemoveSlug,
+} from "./api/slugs";
+import { handleGetSettings, handleUpdateSettings } from "./api/settings";
+import { handleListKeys, handleCreateKey, handleDeleteKey } from "./api/keys";
+import {
+  handleDashboardStats as handleDashboardStatsApi,
+  handleLinkAnalytics,
+  handleLinkTimeline,
+} from "./api/analytics";
+import { handleLinkQr } from "./api/qr";
+import { notFoundResponse } from "./404";
+import { landingResponse } from "./pages/landing";
+import { mcpLandingResponse } from "./mcp/page";
+import { ShrtnrMCP } from "./mcp/server";
+
+import { Layout } from "./pages/layout";
+import { DashboardPage } from "./pages/dashboard";
+import { LinksPage } from "./pages/links";
+import { LinkDetailPage } from "./pages/link-detail";
+import { KeysPage } from "./pages/keys";
+import { SettingsPage } from "./pages/settings";
+
+// ---- Types ----
+
+type AuthContext = {
+  source: "apikey";
+  scope: string | null;
+};
+
+type HonoEnv = {
+  Bindings: Env;
+  Variables: {
+    auth: AuthContext;
+    user: AccessUser | null;
+    identity: string;
+  };
+};
+
+const app = new Hono<HonoEnv>();
+
+// ---- Health check (public) ----
+
+app.get("/_/health", () => handleHealth());
+
+// ---- Admin auth middleware ----
+
+app.use("/_/admin/*", async (c, next) => {
+  const user = await verifyAccessJwt(c.req.raw, c.env);
+  // When ACCESS_AUD is configured, redirect unauthenticated visitors to
+  // the landing page rather than showing a raw 403.
+  if (c.env.ACCESS_AUD && !user) {
+    return c.redirect("/", 302);
+  }
+  c.set("user", user);
+  const identity = await extractIdentity(c.req.raw, c.env);
+  c.set("identity", identity);
+  await next();
+});
+
+// ---- Admin logout ----
+
+app.get("/_/admin/logout", (c) => {
+  const teamDomain = c.env.ACCESS_JWKS_URL
+    ? new URL(c.env.ACCESS_JWKS_URL).origin
+    : null;
+  const logoutUrl = teamDomain
+    ? `${teamDomain}/cdn-cgi/access/logout`
+    : "/_/admin/dashboard";
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: logoutUrl,
+      "Set-Cookie": "CF_Authorization=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+    },
+  });
+});
+
+// ---- Admin page helpers ----
+
+function getCookie(request: Request, name: string): string | null {
+  const header = request.headers.get("Cookie") || "";
+  const match = header.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+async function getPageData(c: { env: Env; req: { raw: Request } }, identity: string) {
+  const settingsResult = await getAppSettings(c.env, identity);
+  const settings = settingsResult.ok ? settingsResult.data : null;
+  const theme = settings?.theme ?? getCookie(c.req.raw, "theme") ?? "oddbit";
+  const lang = settings?.lang ?? getCookie(c.req.raw, "lang") ?? "en";
+  const slugLength = settings?.slug_default_length ?? DEFAULT_SLUG_LENGTH;
+  const t = createTranslateFn(lang);
+  const translations = getTranslations(lang);
+  return { theme, slugLength, lang, t, translations };
+}
+
+// ---- Admin pages ----
+
+app.get("/_/admin/dashboard", async (c) => {
+  const identity = c.var.identity;
+  const { theme, t, lang, translations } = await getPageData(c, identity);
+  const statsResult = await getDashboardStats(c.env);
+  const stats = statsResult.ok ? statsResult.data : { total_links: 0, total_clicks: 0, recent_links: [], top_links: [], top_countries: [], top_referrers: [] };
+  const userEmail = c.var.user?.email ?? null;
+  return c.html(
+    <Layout active="dashboard" theme={theme} t={t} lang={lang} translations={translations} userEmail={userEmail}>
+      <DashboardPage stats={stats} t={t} lang={lang} />
+    </Layout>,
+  );
+});
+
+app.get("/_/admin/links", async (c) => {
+  const identity = c.var.identity;
+  const { theme, slugLength, t, lang, translations } = await getPageData(c, identity);
+  const searchQuery = c.req.query("search") || "";
+  const linksResult = searchQuery
+    ? await searchLinks(c.env, searchQuery)
+    : await listLinks(c.env);
+  const links = linksResult.ok ? linksResult.data : [];
+  const sort = c.req.query("sort") || "recent";
+  const page = parseInt(c.req.query("page") || "1", 10) || 1;
+  const perPage = parseInt(c.req.query("per_page") || "25", 10) || 25;
+  const showDisabled = c.req.query("show_disabled") === "1";
+  const userEmail = c.var.user?.email ?? null;
+  return c.html(
+    <Layout active="links" theme={theme} t={t} lang={lang} translations={translations} userEmail={userEmail}>
+      <LinksPage
+        links={links}
+        sort={sort}
+        page={page}
+        perPage={perPage}
+        showDisabled={showDisabled}
+        searchQuery={searchQuery}
+        t={t}
+        lang={lang}
+      />
+    </Layout>,
+  );
+});
+
+app.get("/_/admin/links/:id", async (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return notFoundResponse();
+  const identity = c.var.identity;
+  const { theme, t, lang, translations } = await getPageData(c, identity);
+  const linkResult = await getLink(c.env, id);
+  if (!linkResult.ok) return notFoundResponse();
+  const analyticsResult = await getLinkAnalytics(c.env, id);
+  const analytics = analyticsResult.ok ? analyticsResult.data : { total_clicks: 0, countries: [], referrers: [], referrer_hosts: [], devices: [], os: [], browsers: [], link_modes: [], channels: [], clicks_over_time: [], slug_clicks: [] };
+  const userEmail = c.var.user?.email ?? null;
+  return c.html(
+    <Layout active="links" theme={theme} t={t} lang={lang} translations={translations} userEmail={userEmail}>
+      <LinkDetailPage link={linkResult.data} analytics={analytics} t={t} lang={lang} />
+    </Layout>,
+  );
+});
+
+app.get("/_/admin/keys", async (c) => {
+  const identity = c.var.identity;
+  const { theme, t, lang, translations } = await getPageData(c, identity);
+  const keysResult = await listAllApiKeys(c.env, identity);
+  const keys = keysResult.ok ? keysResult.data : [];
+  const userEmail = c.var.user?.email ?? null;
+  return c.html(
+    <Layout active="keys" theme={theme} t={t} lang={lang} translations={translations} userEmail={userEmail}>
+      <KeysPage keys={keys as any} t={t} lang={lang} />
+    </Layout>,
+  );
+});
+
+app.get("/_/admin/settings", async (c) => {
+  const identity = c.var.identity;
+  const { theme, slugLength, t, lang, translations } = await getPageData(c, identity);
+  const mcpConfigured = Boolean(c.env.MCP_ACCESS_AUD && c.env.ACCESS_JWKS_URL);
+  const userEmail = c.var.user?.email ?? null;
+  return c.html(
+    <Layout active="settings" theme={theme} t={t} lang={lang} translations={translations} userEmail={userEmail}>
+      <SettingsPage theme={theme} slugLength={slugLength} lang={lang} t={t} mcpConfigured={mcpConfigured} userEmail={userEmail} />
+    </Layout>,
+  );
+});
+
+// ---- Legacy redirects ----
+
+app.get("/_/admin", (c) => c.redirect("/_/admin/dashboard", 302));
+app.get("/_/admin/", (c) => c.redirect("/_/admin/dashboard", 302));
+app.get("/_/admin/link/:slug", (c) => c.redirect("/_/admin/links", 301));
+app.get("/_/dashboard", (c) => c.redirect("/_/admin/dashboard", 301));
+app.get("/_/links", (c) => c.redirect("/_/admin/links", 301));
+app.get("/_/links/:id", (c) => c.redirect(`/_/admin/links/${c.req.param("id")}`, 301));
+app.get("/_/keys", (c) => c.redirect("/_/admin/keys", 301));
+app.get("/_/settings", (c) => c.redirect("/_/admin/settings", 301));
+
+// ---- Admin API routes ----
+
+// Keys
+app.get("/_/admin/api/keys", (c) => handleListKeys(c.env, c.var.identity));
+app.post("/_/admin/api/keys", (c) => handleCreateKey(c.req.raw, c.env, c.var.identity));
+app.delete("/_/admin/api/keys/:id", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleDeleteKey(c.env, c.var.identity, id);
+});
+
+// Links (admin path: no scope checks, full access)
+app.post("/_/admin/api/links", (c) => handleCreateLink(c.req.raw, c.env, "app", c.var.identity, c.executionCtx));
+app.get("/_/admin/api/links", (c) => handleListLinks(c.env));
+app.get("/_/admin/api/links/:id", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleGetLink(c.env, id);
+});
+app.put("/_/admin/api/links/:id", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleUpdateLink(c.req.raw, c.env, id);
+});
+app.get("/_/admin/api/links/:id/analytics", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleLinkAnalytics(c.env, id, c.req.query("range"));
+});
+app.get("/_/admin/api/links/:id/timeline", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleLinkTimeline(c.env, id, c.req.query("range"));
+});
+app.post("/_/admin/api/links/:id/disable", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleDisableLink(c.env, id);
+});
+app.delete("/_/admin/api/links/:id", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleDeleteLink(c.env, id);
+});
+app.post("/_/admin/api/links/:id/slugs", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleAddCustomSlug(c.req.raw, c.env, id);
+});
+app.put("/_/admin/api/links/:id/slugs/primary", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleSetPrimarySlug(c.req.raw, c.env, id);
+});
+app.post("/_/admin/api/links/:id/slugs/:slugId/disable", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  const slugId = parseInt(c.req.param("slugId"), 10);
+  if (isNaN(id) || isNaN(slugId)) return c.json({ error: "Not Found" }, 404);
+  return handleDisableSlug(c.env, id, slugId);
+});
+app.post("/_/admin/api/links/:id/slugs/:slugId/enable", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  const slugId = parseInt(c.req.param("slugId"), 10);
+  if (isNaN(id) || isNaN(slugId)) return c.json({ error: "Not Found" }, 404);
+  return handleEnableSlug(c.env, id, slugId);
+});
+app.delete("/_/admin/api/links/:id/slugs/:slugId", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  const slugId = parseInt(c.req.param("slugId"), 10);
+  if (isNaN(id) || isNaN(slugId)) return c.json({ error: "Not Found" }, 404);
+  return handleRemoveSlug(c.env, id, slugId);
+});
+app.get("/_/admin/api/links/:id/qr", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  return handleLinkQr(c.req.raw, c.env, id);
+});
+
+// Settings
+app.get("/_/admin/api/settings", (c) => handleGetSettings(c.env, c.var.identity));
+app.put("/_/admin/api/settings", (c) => handleUpdateSettings(c.req.raw, c.env, c.var.identity));
+
+// Dashboard stats
+app.get("/_/admin/api/dashboard", (c) => handleDashboardStatsApi(c.env));
+
+// ---- Public API auth middleware ----
+
+app.use("/_/api/*", async (c, next) => {
+  const auth = await resolveAuth(c.req.raw, c.env);
+  if (!auth) return unauthorizedResponse();
+  c.set("auth", auth);
+  await next();
+});
+
+// ---- Public API routes (link management only) ----
+
+app.post("/_/api/links", (c) => {
+  if (!hasScope(c.var.auth, "create")) return forbiddenResponse();
+  const via = c.req.header("X-Client") === "sdk" ? "sdk" : "api";
+  return handleCreateLink(c.req.raw, c.env, via, undefined, c.executionCtx);
+});
+app.get("/_/api/links", (c) => {
+  if (!hasScope(c.var.auth, "read")) return forbiddenResponse();
+  return handleListLinks(c.env);
+});
+app.get("/_/api/links/:id", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  if (!hasScope(c.var.auth, "read")) return forbiddenResponse();
+  return handleGetLink(c.env, id);
+});
+app.put("/_/api/links/:id", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  if (!hasScope(c.var.auth, "create")) return forbiddenResponse();
+  return handleUpdateLink(c.req.raw, c.env, id);
+});
+app.get("/_/api/links/:id/analytics", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  if (!hasScope(c.var.auth, "read")) return forbiddenResponse();
+  return handleLinkAnalytics(c.env, id);
+});
+app.get("/_/api/links/:id/timeline", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  if (!hasScope(c.var.auth, "read")) return forbiddenResponse();
+  return handleLinkTimeline(c.env, id, c.req.query("range"));
+});
+app.post("/_/api/links/:id/disable", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  if (!hasScope(c.var.auth, "create")) return forbiddenResponse();
+  return handleDisableLink(c.env, id);
+});
+app.delete("/_/api/links/:id", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  if (!hasScope(c.var.auth, "create")) return forbiddenResponse();
+  return handleDeleteLink(c.env, id);
+});
+app.post("/_/api/links/:id/slugs", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  if (!hasScope(c.var.auth, "create")) return forbiddenResponse();
+  return handleAddCustomSlug(c.req.raw, c.env, id);
+});
+app.get("/_/api/links/:id/qr", (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "Not Found" }, 404);
+  if (!hasScope(c.var.auth, "read")) return forbiddenResponse();
+  return handleLinkQr(c.req.raw, c.env, id);
+});
+app.get("/_/api/slugs/:slug", (c) => {
+  if (!hasScope(c.var.auth, "read")) return forbiddenResponse();
+  return handleGetLinkBySlug(c.env, c.req.param("slug"));
+});
+
+// ---- Root landing page ----
+
+app.get("/", async (c) => {
+  if (await isSignedIn(c.req.raw, c.env)) return c.redirect("/_/admin/dashboard", 302);
+  return landingResponse();
+});
+
+app.get("/_", async (c) => {
+  if (await isSignedIn(c.req.raw, c.env)) return c.redirect("/_/admin/dashboard", 302);
+  return c.redirect("/", 302);
+});
+
+// ---- Slug redirect (catch-all) ----
+
+app.get("/:slug", (c) => {
+  const slug = c.req.param("slug");
+  if (!slug || slug.startsWith("_")) return notFoundResponse();
+  return handleRedirect(slug, c.req.raw, c.env, c.executionCtx);
+});
+
+// ---- 404 fallback ----
+
+app.notFound(() => notFoundResponse());
+
+// ---- MCP transport handler ----
+
+export { ShrtnrMCP };
+
+const mcpHandler = ShrtnrMCP.serve("/_/mcp");
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    let url = new URL(request.url);
+
+    // CF Access MCP-type applications cannot be scoped to a path — they must
+    // own a full subdomain. Requests arriving on mcp.* are rewritten to the
+    // /_/mcp path so the rest of the routing logic stays unchanged.
+    // The CF MCP portal sends requests to /mcp on the subdomain, so strip that
+    // prefix before prepending the internal /_/mcp mount point.
+    if (
+      url.host.startsWith("mcp.") &&
+      !url.pathname.startsWith("/.well-known") &&
+      !url.pathname.startsWith("/cdn-cgi/")
+    ) {
+      const rewritten = new URL(url.href);
+      const stripped = url.pathname.replace(/^\/mcp(?=\/|$)/, "") || "/";
+      rewritten.pathname = "/_/mcp" + (stripped === "/" ? "" : stripped);
+      request = new Request(rewritten, request);
+      url = rewritten;
+    }
+
+    // MCP landing page for browser visits (no Bearer token, wants HTML).
+    if (
+      request.method === "GET" &&
+      url.pathname === "/_/mcp" &&
+      !request.headers.has("Authorization") &&
+      request.headers.get("Accept")?.includes("text/html")
+    ) {
+      return mcpLandingResponse();
+    }
+
+    // MCP transport endpoint.
+    // The MCP Access application has its own AUD tag (MCP_ACCESS_AUD),
+    // distinct from the admin application (ACCESS_AUD). Pass it explicitly
+    // so JWT validation uses the correct audience.
+    if (url.pathname === "/_/mcp" || url.pathname.startsWith("/_/mcp/")) {
+      const identity = await extractIdentity(request, env, env.MCP_ACCESS_AUD);
+      // In production (MCP_ACCESS_AUD set), reject anonymous requests so
+      // MCP clients and the CF Access AI Controls portal correctly detect
+      // that this endpoint requires authentication.
+      if (identity === "anonymous" && env.MCP_ACCESS_AUD) {
+        return new Response("Unauthorized", {
+          status: 401,
+          headers: {
+            "WWW-Authenticate": `Bearer realm="shrtnr"`,
+          },
+        });
+      }
+      (ctx as unknown as { props: Record<string, unknown> }).props = {
+        email: identity,
+      };
+      return mcpHandler.fetch!(request, env, ctx);
+    }
+
+    // OAuth Authorization Server Metadata (RFC 8414).
+    // MCP clients fetch this to discover OAuth endpoints. Endpoints are
+    // served at the application domain so CF Access can intercept
+    // /cdn-cgi/access/* requests with the correct application context.
+    if (url.pathname === "/.well-known/oauth-authorization-server") {
+      const base = `${url.protocol}//${url.host}`;
+      return Response.json(
+        {
+          issuer: base,
+          authorization_endpoint: `${base}/cdn-cgi/access/oauth/authorization`,
+          token_endpoint: `${base}/cdn-cgi/access/oauth/token`,
+          registration_endpoint: `${base}/cdn-cgi/access/oauth/registration`,
+          jwks_uri: `${base}/cdn-cgi/access/certs`,
+          revocation_endpoint: `${base}/cdn-cgi/access/oauth/revoke`,
+          response_types_supported: ["code"],
+          response_modes_supported: ["query"],
+          grant_types_supported: ["authorization_code", "refresh_token"],
+          token_endpoint_auth_methods_supported: [
+            "client_secret_basic",
+            "client_secret_post",
+            "none",
+          ],
+          code_challenge_methods_supported: ["S256"],
+        },
+        { headers: { "Access-Control-Allow-Origin": "*" } },
+      );
+    }
+
+    // Old OAuth routes: return 404.
+    if (url.pathname.startsWith("/oauth/")) {
+      return notFoundResponse();
+    }
+
+    // Everything else goes to the Hono app.
+    return app.fetch(request, env, ctx);
+  },
+} satisfies ExportedHandler<Env>;
+
+// ---- Auth helpers ----
+
+async function resolveAuth(
+  request: Request,
+  env: Env,
+): Promise<AuthContext | null> {
+  const authHeader = request.headers.get("Authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    const token = authHeader.slice(7);
+    const key = await authenticateApiKey(env, token);
+    if (key) {
+      return { source: "apikey", scope: key.scope };
+    }
+  }
+  return null;
+}
+
+function hasScope(auth: AuthContext, required: string): boolean {
+  if (auth.scope === null) return true;
+  return auth.scope.split(",").includes(required);
+}
+
+function forbiddenResponse(): Response {
+  return new Response(JSON.stringify({ error: "Forbidden" }), {
+    status: 403,
+    headers: { "Content-Type": "application/json" },
+  });
+}

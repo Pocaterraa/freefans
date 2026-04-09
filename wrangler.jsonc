@@ -1,0 +1,39 @@
+{
+  "name": "freefans",
+  "main": "src/index.tsx",
+  "assets": { "directory": "public" },
+  "compatibility_date": "2026-04-01", // LOL
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true
+    }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "freefans-db",
+      "migrations_dir": "migrations","database_id": "1df7fa6a-54be-40a2-9d58-47750790c90e"
+    }
+  ],
+  // Durable Object for MCP agent sessions
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MCP_OBJECT",
+        "class_name": "ShrtnrMCP"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ShrtnrMCP"]
+    }
+  ]
+}
